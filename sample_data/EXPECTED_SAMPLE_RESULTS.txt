@@ -1,0 +1,10 @@
+# Sample test cases
+
+Using the two supplied sample files with tolerance ₹1:
+
+- INV-1001 → Matched
+- INV-1002 → Value Mismatch (IGST difference ₹10)
+- INV-1003 → Matched
+- INV-1004 → Matched
+- INV-1005 → GSTIN Mismatch
+- INV-REG-ONLY → In Register Only
