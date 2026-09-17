@@ -177,9 +177,17 @@ with st.sidebar:
     st.divider()
     st.markdown("### Matching logic")
     st.caption("1. Exact GSTIN + invoice number")
-    st.caption("2. Invoice/tax-value candidate matching")
-    st.caption("3. GSTIN mismatch detection")
-    st.caption("4. Register-only / 2B-only identification")
+    st.caption("2. Same GSTIN + same invoice serial (format-insensitive)")
+    st.caption("3. Same PAN, different state GSTIN")
+    st.caption("4. Split / rate-wise invoice lines summed on either side")
+    st.caption("5. Weighted fuzzy score (invoice, GSTIN, supplier name, values, date)")
+    st.caption("6. Tax-head swap, GSTIN and value mismatch detection")
+    st.caption("7. Register-only / 2B-only identification")
+    st.divider()
+    st.markdown("### Built-in checks")
+    st.caption("GSTIN format & check digit - duplicate invoices - IGST vs CGST/SGST - "
+               "CGST = SGST - invoice value arithmetic - non-standard tax rates - "
+               "missing/future dates - Section 16(4) ITC time limit")
     st.divider()
     st.caption("Use the included sample files first to test the complete workflow.")
     st.markdown(
@@ -223,8 +231,11 @@ with right:
 
 st.markdown("""
 <div class="hint">
-<b>Recommended columns:</b> GSTIN, Invoice No, Invoice Date, 2B Month/Return Period,
-Taxable Value, IGST, CGST, SGST, Cess, Invoice Value.
+<b>Recommended columns:</b> GSTIN, <b>Supplier Name</b>, Invoice No, Invoice Date,
+2B Month/Return Period, Taxable Value, IGST, CGST, SGST, Cess, Invoice Value.
+<br>
+Supplier name is optional &mdash; where it is missing, it is filled in from the GSTIN using
+the supplier directory built from your GSTR-2B.
 <br>
 Column names can vary — the application automatically recognizes common aliases.
 </div>
@@ -293,22 +304,32 @@ if results is not None:
 
     clean_rate = (matched_count / total * 100) if total else 0
 
-    cols = st.columns(5)
+    quality = results.get("quality_checks")
+    high_flags = 0 if quality is None or quality.empty else int((quality["Severity"] == "High").sum())
+
+    cols = st.columns(6)
     cols[0].metric("Inward Register Rows", total)
     cols[1].metric("Matched", matched_count)
     cols[2].metric("Review Required", mismatch_count)
     cols[3].metric("Register Only", register_only)
     cols[4].metric("Clean Match Rate", f"{clean_rate:.1f}%")
+    cols[5].metric("High-Risk Flags", high_flags)
 
     if two_b_only:
         st.info(f"{two_b_only:,} GSTR-2B invoice(s) were not found in the inward register.")
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["Reconciliation", "Review Queue", "GSTR-2B Data", "Register Data"]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["Reconciliation", "Review Queue", "Supplier Summary", "Data Quality",
+         "GSTR-2B Data", "Register Data"]
     )
 
     with tab1:
-        st.dataframe(reco, use_container_width=True, hide_index=True)
+        suppliers = sorted(
+            name for name in reco["supplier_name"].dropna().unique().tolist() if str(name).strip()
+        )
+        chosen = st.multiselect("Filter supplier", suppliers, default=[], key="supplier_filter")
+        view = reco[reco["supplier_name"].isin(chosen)] if chosen else reco
+        st.dataframe(view, use_container_width=True, hide_index=True)
 
     with tab2:
         if mismatch_count:
@@ -327,13 +348,37 @@ if results is not None:
             st.success("No mismatch items were identified.")
 
     with tab3:
+        supplier_summary = results.get("supplier_summary")
+        if supplier_summary is not None and not supplier_summary.empty:
+            st.caption("Supplier-wise position, sorted by the items that need attention first.")
+            st.dataframe(supplier_summary, use_container_width=True, hide_index=True)
+        else:
+            st.info("No supplier summary available.")
+
+    with tab4:
+        if quality is not None and not quality.empty:
+            severities = ["High", "Medium", "Low"]
+            picked = st.multiselect(
+                "Severity", severities,
+                default=[level for level in severities if level in set(quality["Severity"])],
+                key="severity_filter",
+            )
+            st.dataframe(
+                quality[quality["Severity"].isin(picked)],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.success("No data quality issues were found in either file.")
+
+    with tab5:
         st.dataframe(
             results["gstr2b_source"],
             use_container_width=True,
             hide_index=True,
         )
 
-    with tab4:
+    with tab6:
         st.dataframe(
             results["inward_register_source"],
             use_container_width=True,
@@ -373,7 +418,11 @@ for col, (label, path) in zip((c1, c2), sample_files):
             use_container_width=True,
         )
 
-st.caption("Tip: run the supplied sample files first. They contain matched, value-mismatch, GSTIN-mismatch and missing-in-source cases.")
+st.caption(
+    "Tip: run the supplied sample files first. They cover clean matches, value mismatches, "
+    "GSTIN mismatches, same-PAN/different-state GSTINs, invoice-format differences, "
+    "split invoice lines, IGST vs CGST/SGST tax-head swaps, and both one-sided cases."
+)
 
 st.markdown(
     '<div class="footer">Designed &amp; developed by <b>PUSHPAK KUMAR</b> &nbsp;•&nbsp; GST Reconciliation &amp; Reporting<br><span class="resource-links" style="justify-content:center"><a href="https://www.pushpakkumar.com" target="_blank">www.pushpakkumar.com</a><a href="https://www.linkedin.com/in/pkcp22/" target="_blank">LinkedIn &middot; Explore more tools</a></span></div>',
