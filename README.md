@@ -51,6 +51,10 @@ was derived from the GSTIN, or is still unknown.
    supplier name, tax values and invoice date. A pair is only accepted with a
    score of 55+ **and** at least two independent anchors, so stronger matching
    never becomes loose guessing.
+7. Near-miss suggestions: anything still unmatched is scored against the other
+   side's leftovers and the three closest candidates are reported *without*
+   being auto-matched, so a reviewer gets a starting point rather than a dead
+   end.
 
 Each tier is resolved across the whole file before the next one runs, and fuzzy
 pairs are assigned in descending score order, so a strong match can never be
@@ -64,6 +68,34 @@ taken by a weaker one that simply appeared earlier in the file.
 
 Every matched row also carries a match basis, a confidence score, the value
 difference, a date warning and a supplier-name warning.
+
+## Analysis on top of the match
+
+Every reconciled line also carries:
+
+- **ITC action** — claim, hold, correct the register, book the invoice, or chase
+  the supplier — plus the **ITC amount at risk** on that line.
+- **Difference diagnosis** — not just the delta but why: taxable value differs,
+  tax rate differs, same total tax under different heads, cess only, a possible
+  digit transposition (difference divisible by 9), or a rounding difference that
+  a higher tolerance would absorb.
+- **Rate comparison** — implied GST rate on each side, with a warning when they
+  disagree.
+- **Cross-period filing** — the return period the supplier filed in against the
+  period the ITC was booked in, with the gap in months.
+- **Confidence band** — auto / good / low / unmatched, so high-confidence lines
+  can be signed off in bulk.
+- **Aging** — days outstanding and a bucket for every open item.
+
+Report-level analysis:
+
+- **ITC Statement** — ITC as per books vs GSTR-2B, head by head, split into
+  matched, under review, not in 2B and not in books.
+- **Action Plan** — supplier-wise follow-up list, highest ITC exposure first.
+- **Supplier Risk** — a 0-100 risk score per supplier from match rate, ITC
+  exposure and invoices missing from 2B, banded Low / Medium / High / Critical.
+- **Aging Analysis** — open exposure by age bucket and status.
+- **Suggestions** — near-miss candidates for unmatched items.
 
 ## Built-in checks
 
@@ -83,8 +115,9 @@ Run on both files, listed on the `Data Quality Checks` sheet by severity:
 
 ## Excel report
 
-Summary (counts and values), Supplier Summary, Review Queue, In Register Only,
-In 2B Only, Matched Details, Monthly Analysis, Data Quality Checks, Supplier
-Directory, both uploaded files as received, and the full reconciliation — with
+Summary, ITC Statement, Action Plan, Supplier Summary (with risk score), Review
+Queue, In Register Only, In 2B Only, Suggestions, Aging Analysis, Matched
+Details, Monthly Analysis, Data Quality Checks, Supplier Directory, both
+uploaded files as received, and the full reconciliation — with
 filters, frozen headers, money formatting, exception highlighting and clickable
 links back to the matching GSTR-2B row.

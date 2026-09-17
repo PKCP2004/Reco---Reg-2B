@@ -112,6 +112,47 @@ def _number(value) -> float:
     return round(result, 2)
 
 
+_MONTHS = {name: index for index, name in enumerate(
+    ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], start=1)}
+
+
+def _parse_period(value):
+    """Return (year, month) for the many ways a GST return period is written.
+
+    Handles "Jun-26", "JUNE 2026", "062026" (the GST portal's MMYYYY form),
+    "06-2026" and "2026-06". Returns None when nothing sensible can be read.
+    """
+    text = _display_text(value).upper()
+    if not text:
+        return None
+    for name, month in _MONTHS.items():
+        if name in text:
+            year_match = re.search(r"(\d{2,4})", text.replace(name, " "))
+            if not year_match:
+                return None
+            year = int(year_match.group(1))
+            return (year + 2000 if year < 100 else year, month)
+    digits = re.sub(r"[^0-9]", "", text)
+    if len(digits) == 6:  # MMYYYY (portal) or YYYYMM
+        first, second = int(digits[:2]), int(digits[2:])
+        if 1 <= first <= 12:
+            return (second, first)
+        year, month = int(digits[:4]), int(digits[4:])
+        if 1 <= month <= 12:
+            return (year, month)
+    match = re.match(r"^(\d{4})[-/](\d{1,2})$", text)
+    if match and 1 <= int(match.group(2)) <= 12:
+        return (int(match.group(1)), int(match.group(2)))
+    match = re.match(r"^(\d{1,2})[-/](\d{4})$", text)
+    if match and 1 <= int(match.group(1)) <= 12:
+        return (int(match.group(2)), int(match.group(1)))
+    return None
+
+
+def _period_months(period) -> int | None:
+    return None if period is None else period[0] * 12 + period[1]
+
+
 def _pan(gstin: str) -> str:
     """The 10-character PAN embedded in a 15-character GSTIN."""
     return gstin[2:12] if len(gstin) == 15 else ""
@@ -195,6 +236,9 @@ def standardize_frame(frame: pd.DataFrame, source: str) -> pd.DataFrame:
     for field in VALUE_FIELDS:
         output[field] = output[field].map(_number)
 
+    output["period_key"] = output["two_b_month"].map(
+        lambda value: (lambda parsed: f"{parsed[0]:04d}-{parsed[1]:02d}" if parsed else "")(_parse_period(value))
+    )
     output["supplier_key"] = output["supplier_name"].map(_name_key)
     output["pan"] = output["gstin"].map(_pan)
     output["invoice_core"] = output["invoice_raw"].map(_invoice_core)
@@ -299,6 +343,241 @@ def run_quality_checks(frame: pd.DataFrame, label: str, tolerance: float = 1.0) 
             flag("Low", "Negative values", "Looks like a credit note / debit note line.")
 
     return pd.DataFrame(issues, columns=QUALITY_COLUMNS)
+
+
+
+# ---------------------------------------------------------------------------
+# Result enrichment - the analytical layer on top of the raw match
+# ---------------------------------------------------------------------------
+AGING_BUCKETS = [(30, "0-30 days"), (60, "31-60 days"), (90, "61-90 days"),
+                 (180, "91-180 days"), (10 ** 6, "Over 180 days")]
+
+
+def _as_number(value) -> float:
+    try:
+        if value is None or value == "" or pd.isna(value):
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _implied_rate(taxable: float, tax: float):
+    if not taxable:
+        return None
+    return round(tax / taxable * 100, 2)
+
+
+def _difference_reason(row, tolerance: float) -> str:
+    """Explain *why* the two sides differ, instead of only showing the delta."""
+    if not str(row.get("difference", "")).strip():
+        return ""
+    taxable_gap = _as_number(row.get("2B_taxable")) - _as_number(row.get("Register_taxable"))
+    tax_2b = sum(_as_number(row.get(f"2B_{head}")) for head in ("igst", "cgst", "sgst"))
+    tax_reg = sum(_as_number(row.get(f"Register_{head}")) for head in ("igst", "cgst", "sgst"))
+    tax_gap = tax_2b - tax_reg
+    reasons = []
+
+    head_gaps = {
+        head: _as_number(row.get(f"2B_{head}")) - _as_number(row.get(f"Register_{head}"))
+        for head in ("igst", "cgst", "sgst")
+    }
+    if abs(taxable_gap) <= tolerance and abs(tax_gap) <= tolerance:
+        if any(abs(gap) > tolerance for gap in head_gaps.values()):
+            reasons.append("Same total tax, charged under different heads (IGST vs CGST/SGST)")
+        elif abs(_as_number(row.get("2B_cess")) - _as_number(row.get("Register_cess"))) > tolerance:
+            reasons.append("Cess difference only")
+        else:
+            reasons.append("Invoice-value difference only")
+    if abs(taxable_gap) <= tolerance and abs(tax_gap) > tolerance:
+        rate_2b = _implied_rate(_as_number(row.get("2B_taxable")), tax_2b)
+        rate_reg = _implied_rate(_as_number(row.get("Register_taxable")), tax_reg)
+        if rate_2b is not None and rate_reg is not None and abs(rate_2b - rate_reg) > 0.2:
+            reasons.append(f"Tax rate differs ({rate_reg:.2f}% booked vs {rate_2b:.2f}% in 2B)")
+        else:
+            reasons.append("Same taxable value, tax amount differs")
+    if abs(taxable_gap) > tolerance:
+        reasons.append("Taxable value differs")
+    for gap in (taxable_gap, tax_gap):
+        whole = abs(round(gap, 0))
+        if whole and abs(gap - round(gap, 0)) < 0.01 and whole % 9 == 0 and whole >= 9:
+            reasons.append("Difference divisible by 9 - possible digit transposition")
+            break
+    if 0 < abs(taxable_gap) <= max(tolerance * 2, 2) and 0 < abs(tax_gap) <= max(tolerance * 2, 2):
+        reasons.append("Looks like a rounding difference - consider raising tolerance")
+    return "; ".join(dict.fromkeys(reasons)) or "Mixed difference"
+
+
+def _itc_position(row) -> tuple[str, float]:
+    """Map a status to the action the ITC needs, and the amount exposed."""
+    status = row.get("status", "")
+    tax_2b = sum(_as_number(row.get(f"2B_{head}")) for head in ("igst", "cgst", "sgst", "cess"))
+    tax_reg = sum(_as_number(row.get(f"Register_{head}")) for head in ("igst", "cgst", "sgst", "cess"))
+    if status == "Matched":
+        return "Claim ITC", 0.0
+    if status == "In Register Only":
+        return "ITC not available - follow up with supplier", tax_reg
+    if status == "In 2B Only":
+        return "ITC available but not booked - record the purchase", tax_2b
+    if status in ("Likely Match - Invoice Format", "Likely Match - Register Invoice Error"):
+        return "Correct the register, then claim", 0.0
+    if status == "GSTIN Mismatch":
+        return "Hold - wrong GSTIN, ITC may be inadmissible", tax_reg
+    if status == "Same PAN - Different GSTIN":
+        return "Hold - confirm which registration may claim", tax_reg
+    if status == "Tax Head Mismatch (IGST vs CGST/SGST)":
+        return "Hold - tax head needs correction before set-off", max(tax_2b, tax_reg)
+    if status == "Value Mismatch":
+        return "Claim the lower amount, reconcile the balance", abs(tax_reg - tax_2b)
+    return "Review", 0.0
+
+
+def enrich_result(result: pd.DataFrame, tolerance: float, today: date | None = None) -> pd.DataFrame:
+    """Add rate, period, difference-reason, ITC and aging analytics."""
+    if result.empty:
+        for column in ["rate_2b", "rate_register", "rate_warning", "period_2b", "period_register",
+                       "period_gap_months", "period_warning", "difference_reason", "itc_action",
+                       "itc_amount_at_risk", "days_outstanding", "aging_bucket", "confidence_band"]:
+            result[column] = []
+        return result
+
+    today = today or date.today()
+    rows = result.to_dict("records")
+    enriched = []
+    for row in rows:
+        tax_2b = sum(_as_number(row.get(f"2B_{head}")) for head in ("igst", "cgst", "sgst"))
+        tax_reg = sum(_as_number(row.get(f"Register_{head}")) for head in ("igst", "cgst", "sgst"))
+        rate_2b = _implied_rate(_as_number(row.get("2B_taxable")), tax_2b)
+        rate_reg = _implied_rate(_as_number(row.get("Register_taxable")), tax_reg)
+        rate_warning = ""
+        if rate_2b is not None and rate_reg is not None and abs(rate_2b - rate_reg) > 0.2:
+            rate_warning = f"Rate differs: 2B {rate_2b:.2f}% vs register {rate_reg:.2f}%"
+
+        period_2b = _parse_period(row.get("2B_two_b_month"))
+        period_reg = _parse_period(row.get("Register_two_b_month"))
+        gap = None
+        period_warning = ""
+        if period_2b and period_reg:
+            gap = _period_months(period_2b) - _period_months(period_reg)
+            if gap:
+                direction = "later" if gap > 0 else "earlier"
+                period_warning = (f"Supplier filed {abs(gap)} month(s) {direction} than the period "
+                                  f"the ITC was booked in")
+
+        itc_action, at_risk = _itc_position(row)
+
+        days_outstanding = None
+        aging_bucket = ""
+        if row.get("status") in ("In Register Only", "In 2B Only") or row.get("status") in REVIEW_STATUSES:
+            invoice_date = row.get("invoice_date") or ""
+            if invoice_date:
+                days_outstanding = (today - date.fromisoformat(str(invoice_date))).days
+                for limit, label in AGING_BUCKETS:
+                    if days_outstanding <= limit:
+                        aging_bucket = label
+                        break
+
+        confidence = _as_number(row.get("confidence"))
+        if confidence >= 96:
+            band = "Auto - high confidence"
+        elif confidence >= 70:
+            band = "Review - good confidence"
+        elif confidence > 0:
+            band = "Review - low confidence"
+        else:
+            band = "Unmatched"
+
+        row.update({
+            "rate_2b": rate_2b,
+            "rate_register": rate_reg,
+            "rate_warning": rate_warning,
+            "period_2b": row.get("2B_two_b_month", ""),
+            "period_register": row.get("Register_two_b_month", ""),
+            "period_gap_months": gap,
+            "period_warning": period_warning,
+            "difference_reason": _difference_reason(row, tolerance),
+            "itc_action": itc_action,
+            "itc_amount_at_risk": round(at_risk, 2),
+            "days_outstanding": days_outstanding,
+            "aging_bucket": aging_bucket,
+            "confidence_band": band,
+        })
+        enriched.append(row)
+    return pd.DataFrame(enriched, index=result.index)
+
+
+def build_itc_statement(result: pd.DataFrame) -> pd.DataFrame:
+    """The classic ITC reconciliation statement, head by head."""
+    heads = [("igst", "IGST"), ("cgst", "CGST"), ("sgst", "SGST"), ("cess", "Cess")]
+    if result.empty:
+        return pd.DataFrame(columns=["Tax Head", "ITC as per Books", "ITC as per GSTR-2B",
+                                     "Matched ITC", "ITC under Review", "ITC not in 2B",
+                                     "ITC not in Books", "Difference (Books - 2B)"])
+    matched = result[result["status"] == "Matched"]
+    review = result[result["status"].isin(REVIEW_STATUSES)]
+    register_only = result[result["status"] == "In Register Only"]
+    two_b_only = result[result["status"] == "In 2B Only"]
+
+    def total(frame, column):
+        if frame.empty or column not in frame.columns:
+            return 0.0
+        return round(float(frame[column].map(_as_number).sum()), 2)
+
+    rows = []
+    for field, label in heads:
+        books = total(result, f"Register_{field}")
+        two_b = total(result, f"2B_{field}")
+        rows.append({
+            "Tax Head": label,
+            "ITC as per Books": books,
+            "ITC as per GSTR-2B": two_b,
+            "Matched ITC": total(matched, f"Register_{field}"),
+            "ITC under Review": total(review, f"Register_{field}"),
+            "ITC not in 2B": total(register_only, f"Register_{field}"),
+            "ITC not in Books": total(two_b_only, f"2B_{field}"),
+            "Difference (Books - 2B)": round(books - two_b, 2),
+        })
+    totals = {"Tax Head": "Total"}
+    for column in rows[0]:
+        if column != "Tax Head":
+            totals[column] = round(sum(row[column] for row in rows), 2)
+    rows.append(totals)
+    return pd.DataFrame(rows)
+
+
+def build_aging(result: pd.DataFrame) -> pd.DataFrame:
+    """How long open items have been sitting, by status."""
+    open_items = result[result["aging_bucket"] != ""] if "aging_bucket" in result.columns else result.iloc[0:0]
+    if open_items.empty:
+        return pd.DataFrame(columns=["Aging Bucket", "Status", "Invoices", "Taxable_Value",
+                                     "ITC_At_Risk", "Invoice_Value"])
+    aging = open_items.groupby(["aging_bucket", "status"], dropna=False).agg(
+        Invoices=("status", "size"),
+        Taxable_Value=("taxable", "sum"),
+        ITC_At_Risk=("itc_amount_at_risk", "sum"),
+        Invoice_Value=("total", "sum"),
+    ).reset_index().rename(columns={"aging_bucket": "Aging Bucket", "status": "Status"})
+    order = {label: index for index, (_, label) in enumerate(AGING_BUCKETS)}
+    aging["_order"] = aging["Aging Bucket"].map(order).fillna(99)
+    return aging.sort_values(["_order", "Status"]).drop(columns=["_order"]).reset_index(drop=True)
+
+
+def build_action_plan(result: pd.DataFrame) -> pd.DataFrame:
+    """A supplier-wise follow-up list, worst exposure first."""
+    open_items = result[result["status"] != "Matched"] if not result.empty else result
+    if open_items.empty:
+        return pd.DataFrame(columns=["Supplier Name", "GSTIN", "Open Items", "ITC_At_Risk",
+                                     "Invoice_Value", "Main Issue", "Suggested Action"])
+    plan = open_items.copy()
+    plan["Supplier Name"] = plan["supplier_name"].replace("", "Unknown supplier")
+    grouped = plan.groupby(["Supplier Name", "gstin"], dropna=False).agg(
+        Open_Items=("status", "size"),
+        ITC_At_Risk=("itc_amount_at_risk", "sum"),
+        Invoice_Value=("total", "sum"),
+        Main_Issue=("status", lambda values: values.mode().iloc[0]),
+        Suggested_Action=("itc_action", lambda values: values.mode().iloc[0]),
+    ).reset_index().rename(columns={"gstin": "GSTIN"})
+    return grouped.sort_values(["ITC_At_Risk", "Invoice_Value"], ascending=False).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +1005,51 @@ def reconcile(gstr2b: pd.DataFrame, register: pd.DataFrame, tolerance: float = 1
                       action="Follow up with the supplier - invoice not filed or filed in another period")
 
     # ------------------------------------------------------------------
+    # Phase 4 - near-miss suggestions. Anything left unmatched is scored
+    # against the other side's leftovers and the three closest candidates are
+    # reported WITHOUT being auto-matched, so a reviewer gets a starting point
+    # instead of a dead end - and the engine never guesses on their behalf.
+    # ------------------------------------------------------------------
+    if progress_callback:
+        progress_callback(0.91, "Finding near-miss suggestions for unmatched items")
+
+    open_two_b = [row for row_id, row in two_b_records.items() if row_id not in matched_two_b_rows]
+    open_register = [row for row_id, row in inward_records.items() if row_id not in matched_register_rows]
+    suggestion_rows = []
+    for source_row in open_two_b:
+        scored = sorted(
+            ((score_pair(source_row, target)[0], target) for target in open_register),
+            key=lambda item: -item[0],
+        )[:3]
+        for rank, (score, target) in enumerate(scored, start=1):
+            if score < 25:
+                continue
+            suggestion_rows.append({
+                "Unmatched From": "GSTR-2B",
+                "Source Row": source_row["source_row"],
+                "Supplier Name": source_row["supplier_name"],
+                "GSTIN": source_row["gstin"],
+                "Invoice No": source_row["invoice_raw"] or source_row["invoice_no"],
+                "Invoice Date": source_row["invoice_date"],
+                "Invoice Value": source_row["total"],
+                "Suggestion Rank": rank,
+                "Candidate Row": target["source_row"],
+                "Candidate Supplier": target["supplier_name"],
+                "Candidate GSTIN": target["gstin"],
+                "Candidate Invoice No": target["invoice_raw"] or target["invoice_no"],
+                "Candidate Invoice Date": target["invoice_date"],
+                "Candidate Invoice Value": target["total"],
+                "Similarity Score": score,
+                "Why": score_pair(source_row, target)[1],
+                "Value Gap": round(source_row["total"] - target["total"], 2),
+            })
+    suggestions = pd.DataFrame(suggestion_rows)
+    if not suggestions.empty:
+        suggestions = suggestions.sort_values(
+            ["Similarity Score", "Source Row"], ascending=[False, True]
+        ).reset_index(drop=True)
+
+    # ------------------------------------------------------------------
     # Result assembly
     # ------------------------------------------------------------------
     if progress_callback:
@@ -753,12 +1077,19 @@ def reconcile(gstr2b: pd.DataFrame, register: pd.DataFrame, tolerance: float = 1
         result["duplicate_2b_invoice"] = "No"
         result["duplicate_register_invoice"] = "No"
 
+    result = enrich_result(result, tolerance)
+
     # Supplier name sits right next to the GSTIN so the sheet reads naturally.
     preferred = [
         "supplier_name", "gstin", "invoice_no", "invoice_date", "two_b_month",
-        "status", "confidence", "match_basis", "difference", "value_difference_total",
-        "date_warning", "supplier_name_warning", "recommended_action",
-        "two_b_row", "register_row",
+        "status", "confidence", "confidence_band", "match_basis",
+        "itc_action", "itc_amount_at_risk",
+        "difference", "difference_reason", "value_difference_total",
+        "rate_2b", "rate_register", "rate_warning",
+        "period_warning", "period_gap_months",
+        "date_warning", "supplier_name_warning",
+        "days_outstanding", "aging_bucket",
+        "recommended_action", "two_b_row", "register_row",
     ]
     ordered = [column for column in preferred if column in result.columns]
     result = result[ordered + [column for column in result.columns if column not in ordered]]
@@ -823,8 +1154,24 @@ def reconcile(gstr2b: pd.DataFrame, register: pd.DataFrame, tolerance: float = 1
         supplier_summary["Match_Rate_%"] = (
             supplier_summary["Matched"] / supplier_summary["Invoices"] * 100
         ).round(1)
+        at_risk = working.groupby(["Supplier Name", "gstin"], dropna=False)["itc_amount_at_risk"].sum()
+        supplier_summary["ITC_At_Risk"] = supplier_summary.set_index(
+            ["Supplier Name", "GSTIN"]
+        ).index.map(at_risk).astype(float).round(2)
+        # Risk = unmatched rate, exposure share and review share, weighted.
+        exposure = supplier_summary["Invoice_Value"].abs().replace(0, pd.NA)
+        risk = (
+            0.45 * (100 - supplier_summary["Match_Rate_%"])
+            + 0.35 * ((supplier_summary["ITC_At_Risk"] / exposure * 100).fillna(0).clip(0, 100))
+            + 0.20 * ((supplier_summary["In_Register_Only"] / supplier_summary["Invoices"]) * 100)
+        )
+        supplier_summary["Risk_Score"] = risk.clip(0, 100).round(1)
+        supplier_summary["Risk_Band"] = pd.cut(
+            supplier_summary["Risk_Score"], bins=[-0.1, 20, 45, 70, 100],
+            labels=["Low", "Medium", "High", "Critical"],
+        ).astype(str)
         supplier_summary = supplier_summary.sort_values(
-            ["Needs_Review", "In_Register_Only", "Invoice_Value"], ascending=False
+            ["Risk_Score", "ITC_At_Risk"], ascending=False
         ).reset_index(drop=True)
 
     quality = pd.concat(
@@ -847,6 +1194,10 @@ def reconcile(gstr2b: pd.DataFrame, register: pd.DataFrame, tolerance: float = 1
     empty = result.iloc[0:0]
     return {
         "reconciliation": result,
+        "itc_statement": build_itc_statement(result),
+        "aging_analysis": build_aging(result),
+        "action_plan": build_action_plan(result),
+        "suggestions": suggestions,
         "gstr2b_source": two_b_source,
         "inward_register_source": inward_source,
         "matched_details": matched_details,
@@ -874,8 +1225,11 @@ def read_upload(upload) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 MONEY_COLUMNS = {
     "taxable", "igst", "cgst", "sgst", "cess", "total", "value_difference_total",
-    "Taxable_Value", "IGST", "CGST", "SGST", "Cess", "Invoice_Value",
-    "Value_Difference", "Value (Rs.)",
+    "itc_amount_at_risk", "Taxable_Value", "IGST", "CGST", "SGST", "Cess",
+    "Invoice_Value", "Value_Difference", "Value (Rs.)", "ITC_At_Risk", "ITC_At_Risk_Total",
+    "ITC as per Books", "ITC as per GSTR-2B", "Matched ITC", "ITC under Review",
+    "ITC not in 2B", "ITC not in Books", "Difference (Books - 2B)",
+    "Invoice Value", "Candidate Invoice Value", "Value Gap",
 }
 
 
@@ -890,6 +1244,13 @@ def export_results(results: dict[str, pd.DataFrame], progress_callback=None) -> 
 
     quality = results.get("quality_checks", pd.DataFrame())
     high_severity = int((quality["Severity"] == "High").sum()) if not quality.empty else 0
+    reconciliation = results["reconciliation"]
+    supplier_summary = results.get("supplier_summary", pd.DataFrame())
+    high_risk_suppliers = (
+        int(supplier_summary["Risk_Band"].isin(["High", "Critical"]).sum())
+        if supplier_summary is not None and not supplier_summary.empty and "Risk_Band" in supplier_summary
+        else 0
+    )
 
     summary = pd.DataFrame([
         {"Metric": "GSTR-2B rows", "Count": len(results["gstr2b_source"]),
@@ -905,6 +1266,11 @@ def export_results(results: dict[str, pd.DataFrame], progress_callback=None) -> 
          "Value (Rs.)": value_of(results["missing_in_register"])},
         {"Metric": "Suppliers identified", "Count": len(results.get("supplier_directory", pd.DataFrame())),
          "Value (Rs.)": 0.0},
+        {"Metric": "ITC at risk (all open items)", "Count": len(reconciliation[reconciliation["status"] != "Matched"]) if not reconciliation.empty else 0,
+         "Value (Rs.)": value_of(reconciliation, "itc_amount_at_risk")},
+        {"Metric": "Suppliers at High/Critical risk", "Count": high_risk_suppliers, "Value (Rs.)": 0.0},
+        {"Metric": "Near-miss suggestions raised", "Count": len(results.get("suggestions", pd.DataFrame())),
+         "Value (Rs.)": 0.0},
         {"Metric": "High-severity data quality flags", "Count": high_severity, "Value (Rs.)": 0.0},
     ])
 
@@ -912,10 +1278,14 @@ def export_results(results: dict[str, pd.DataFrame], progress_callback=None) -> 
 
     sheets = [
         ("Summary", summary),
+        ("ITC_Statement", results.get("itc_statement")),
+        ("Action_Plan", results.get("action_plan")),
         ("Supplier_Summary", results.get("supplier_summary")),
         ("Review_Queue", results["mismatches"]),
         ("In_Register_Only", results["missing_in_2b"]),
         ("In_2B_Only", results["missing_in_register"]),
+        ("Suggestions", results.get("suggestions")),
+        ("Aging_Analysis", results.get("aging_analysis")),
         ("Matched_Details", results.get("matched_details")),
         ("Monthly_Analysis", results.get("monthly_analysis")),
         ("Data_Quality_Checks", quality),

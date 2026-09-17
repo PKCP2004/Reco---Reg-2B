@@ -183,6 +183,11 @@ with st.sidebar:
     st.caption("5. Weighted fuzzy score (invoice, GSTIN, supplier name, values, date)")
     st.caption("6. Tax-head swap, GSTIN and value mismatch detection")
     st.caption("7. Register-only / 2B-only identification")
+    st.caption("8. Near-miss suggestions for whatever is still unmatched")
+    st.divider()
+    st.markdown("### Analysis")
+    st.caption("ITC statement - action plan - supplier risk score - aging - "
+               "cross-period filing - rate comparison - difference diagnosis")
     st.divider()
     st.markdown("### Built-in checks")
     st.caption("GSTIN format & check digit - duplicate invoices - IGST vs CGST/SGST - "
@@ -307,19 +312,27 @@ if results is not None:
     quality = results.get("quality_checks")
     high_flags = 0 if quality is None or quality.empty else int((quality["Severity"] == "High").sum())
 
-    cols = st.columns(6)
+    itc_at_risk = float(reco["itc_amount_at_risk"].sum()) if "itc_amount_at_risk" in reco else 0.0
+
+    cols = st.columns(4)
     cols[0].metric("Inward Register Rows", total)
     cols[1].metric("Matched", matched_count)
     cols[2].metric("Review Required", mismatch_count)
-    cols[3].metric("Register Only", register_only)
-    cols[4].metric("Clean Match Rate", f"{clean_rate:.1f}%")
-    cols[5].metric("High-Risk Flags", high_flags)
+    cols[3].metric("Clean Match Rate", f"{clean_rate:.1f}%")
+
+    cols = st.columns(4)
+    cols[0].metric("Register Only", register_only)
+    cols[1].metric("2B Only", two_b_only)
+    cols[2].metric("ITC at Risk", f"Rs. {itc_at_risk:,.0f}")
+    cols[3].metric("High-Risk Flags", high_flags)
 
     if two_b_only:
         st.info(f"{two_b_only:,} GSTR-2B invoice(s) were not found in the inward register.")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["Reconciliation", "Review Queue", "Supplier Summary", "Data Quality",
+    (tab1, tab_itc, tab_action, tab2, tab3, tab_aging, tab_suggest,
+     tab4, tab5, tab6) = st.tabs(
+        ["Reconciliation", "ITC Statement", "Action Plan", "Review Queue",
+         "Supplier Risk", "Aging", "Suggestions", "Data Quality",
          "GSTR-2B Data", "Register Data"]
     )
 
@@ -347,13 +360,41 @@ if results is not None:
         else:
             st.success("No mismatch items were identified.")
 
+    def show(frame, empty_message, caption=None):
+        if frame is not None and not frame.empty:
+            if caption:
+                st.caption(caption)
+            st.dataframe(frame, use_container_width=True, hide_index=True)
+        else:
+            st.info(empty_message)
+
+    with tab_itc:
+        show(results.get("itc_statement"),
+             "No ITC statement available.",
+             "Input tax credit as per books against GSTR-2B, head by head.")
+
+    with tab_action:
+        show(results.get("action_plan"),
+             "Nothing outstanding - every line matched.",
+             "Supplier-wise follow-up list, highest ITC exposure first.")
+
+    with tab_aging:
+        show(results.get("aging_analysis"),
+             "No open items to age.",
+             "How long unmatched and under-review items have been sitting.")
+
+    with tab_suggest:
+        show(results.get("suggestions"),
+             "No near-miss candidates were found for the unmatched items.",
+             "Closest candidates for unmatched invoices. These are NOT auto-matched - "
+             "confirm before acting on them.")
+
     with tab3:
         supplier_summary = results.get("supplier_summary")
-        if supplier_summary is not None and not supplier_summary.empty:
-            st.caption("Supplier-wise position, sorted by the items that need attention first.")
-            st.dataframe(supplier_summary, use_container_width=True, hide_index=True)
-        else:
-            st.info("No supplier summary available.")
+        show(supplier_summary,
+             "No supplier summary available.",
+             "Supplier-wise position with a risk score built from match rate, ITC exposure "
+             "and invoices missing from 2B.")
 
     with tab4:
         if quality is not None and not quality.empty:
